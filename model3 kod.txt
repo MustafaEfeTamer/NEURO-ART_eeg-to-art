@@ -1,0 +1,124 @@
+import h5py
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+# ==========================================
+# 1. VERİ YÜKLEME VE SÜREKLİ ETİKET DÖNÜŞÜMÜ
+# ==========================================
+print("⏳ Veri yükleniyor...")
+with h5py.File('dreamer_dl_dataset.mat', 'r') as f:
+    X = np.array(f['X']).transpose(2, 0, 1)
+    Y_raw = np.array(f['Y']).T  # 1 ile 5 arasında değerler
+
+print(f"X (Giriş) Boyutu: {X.shape}")
+
+# 🚀 EKLENEN KISIM: Veri Normalizasyonu (Flask'taki yapının aynısı)
+# Her bir EEG penceresini (128 adım) kendi içinde standartlaştırıyoruz
+X_mean = np.mean(X, axis=1, keepdims=True)
+X_std = np.std(X, axis=1, keepdims=True)
+X = (X - X_mean) / (X_std + 1e-8)
+print("✅ EEG verisi Z-Score ile normalize edildi.")
+
+Y_raw_2d = Y_raw[:, :2]
+
+# Orijinal 1-5 ölçeğini, -1 ile 1 aralığına çekiyoruz (Regresyon için)
+Y_scaled = (Y_raw_2d - 3.0) / 2.0
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, Y_scaled, test_size=0.2, random_state=42
+)
+
+# ==========================================
+# 2. VERİ ARTIRMA (DATA AUGMENTATION)
+# ==========================================
+print("\n🧬 Negatif Valence bölgeleri için veri artırma yapılıyor...")
+noise_factor = 0.05
+X_aug = []
+y_aug = []
+
+# Eski Üzgün/Sakin bölgelerine denk gelen (Valence < 0) verileri çoğaltıyoruz
+for i in range(len(X_train)):
+    if y_train[i, 0] < 0: # Valence değeri 0'dan küçükse
+        noisy_sample = X_train[i] + noise_factor * np.random.normal(loc=0.0, scale=1.0, size=X_train[i].shape)
+        X_aug.append(noisy_sample)
+        y_aug.append(y_train[i])
+
+if X_aug:
+    X_train = np.vstack((X_train, np.array(X_aug)))
+    y_train = np.vstack((y_train, np.array(y_aug)))
+    print(f"✅ {len(X_aug)} adet sentetik EEG verisi eklendi.")
+
+# ==========================================
+# 3. REGRESYON MİMARİSİ: 1D-CNN + Bi-LSTM + ATTENTION
+# ==========================================
+inputs = layers.Input(shape=(128, 14))
+
+# GÖZLER (1D-CNN)
+x = layers.Conv1D(filters=64, kernel_size=5, activation='relu', padding='same')(inputs)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling1D(pool_size=2)(x)
+
+x = layers.Conv1D(filters=128, kernel_size=3, activation='relu', padding='same')(x)
+x = layers.BatchNormalization()(x)
+x = layers.MaxPooling1D(pool_size=2)(x)
+x = layers.Dropout(0.3)(x)
+
+# HAFIZA (Çift Yönlü LSTM)
+lstm_out = layers.Bidirectional(layers.LSTM(64, return_sequences=True))(x)
+lstm_out = layers.Dropout(0.4)(lstm_out)
+
+# DİKKAT (Attention Mekanizması)
+attention_weights = layers.Dense(1, activation='tanh')(lstm_out)
+attention_weights = layers.Softmax(axis=1)(attention_weights)
+attention_out = layers.Multiply()([lstm_out, attention_weights])
+
+x = layers.GlobalAveragePooling1D()(attention_out)
+
+# KARAR MEKANİZMASI (Sürekli Değer / Regresyon)
+x = layers.Dense(64, activation='relu')(x)
+x = layers.Dropout(0.4)(x)
+
+# DİKKAT: 2 nöron (Valence, Arousal) ve aktivasyon 'tanh' (-1 ile 1 arası)
+outputs = layers.Dense(2, activation='tanh')(x)
+
+model = models.Model(inputs=inputs, outputs=outputs)
+
+# Regresyon için MSE (Ortalama Karesel Hata) kullanıyoruz. accuracy yerine MAE (Ortalama Mutlak Hata) izleyeceğiz.
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+              loss='mse',
+              metrics=['mae'])
+
+# ==========================================
+# 4. EĞİTİM VE TEST
+# ==========================================
+print("\n🚀 Regresyon Modeli eğitimi başlıyor...")
+history = model.fit(
+    X_train, y_train,
+    epochs=40,
+    batch_size=64,
+    validation_split=0.1,
+    verbose=1
+    # Regresyonda class_weight kullanılmaz, onu kaldırdık.
+)
+
+print("\n📊 --- Test Verisi Üzerinde Başarı Metrikleri ---")
+y_pred = model.predict(X_test)
+
+mse = mean_squared_error(y_test, y_pred)
+mae = mean_absolute_error(y_test, y_pred)
+
+print(f"\nOrtalama Karesel Hata (MSE): {mse:.4f}")
+print(f"Ortalama Mutlak Hata (MAE): {mae:.4f}")
+
+# Örnek tahminleri gösterelim
+print("\n🔍 Örnek 5 Tahmin vs Gerçek Değer:")
+for i in range(5):
+    print(f"Gerçek [V, A]: [{y_test[i][0]:.2f}, {y_test[i][1]:.2f}] --> Tahmin: [{y_pred[i][0]:.2f}, {y_pred[i][1]:.2f}]")
+
+# Modeli Kaydetme
+save_path = 'neuro_art_regression_tanh.keras'
+model.save(save_path)
+print(f"\n✅ Regresyon modeli başarıyla kaydedildi: {save_path}")
